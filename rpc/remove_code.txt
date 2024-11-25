@@ -1,0 +1,250 @@
+
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+------------------------------------------------------------------------------------------------------------------------
+FilterService.thrift
+
+// please run the command to generate code
+// thrift -gen java CERService.thrift
+// version 1: only support my method
+
+service FilterService{
+    // 输入参数1:表名字，参数2:各个变量对应的独立谓词列表，暂时不支持谓词带OR形式
+    // 输出参数：每个变量对应的事件
+    // load events based on predicates
+    // return key: variable name, value: event number
+    map<string, i32> initial(1:string tableName, 2:map<string, list<string>> independentPredicateMap)
+
+    // generate interval set that maybe contain matched results
+    // return time interval
+    binary generateIntervals(1:string variableName, 2:i64 window, 3:i32 headTailMarker)
+
+
+    // 等待完善...
+    // 很难预估出一个统一的Bloom Filter大小，最开始保存每个变量的选择率？然后我们统计Shrink Filter的interval Marker的1的个数预估？
+    // 这样的做法是可以的，就是分配的空间会很浪费，因为属性值有重复的，后续优化一下，目前按照这个逻辑来
+    // 这个算法很麻烦，比如说PATTERN(A N*? B N*? C) 执行顺序是A -> B -> C
+    // 算法：已经请求的变量集合S,尚未请求的变量集合T，如果当前请求的变量和之前请求的变量有依赖谓词，则产生Bloom filter
+    // 由于我们倾向于选择选择率低的，因此生成Bloom Filter时是根据之前的变量来生成的
+    // map<string, list<string>> dependentPredicateMap, 前一个是两个变量的复合，后一个是对应的谓词列表
+    // get bloom filter for join operation,
+    // e.g., t1.a = t2.a and t1.b = t2.b
+    // key: <t1,t2> value: <t1.a = t2.a, t1.b = t2.b>
+    map<string, binary> generateBF4EqualJoin(1:string variableName, 2:i64 window, 3:map<string, list<string>> dependentPredicateMap, 4:map<string, i32> eventNumMap)
+
+
+    // non equal predicates处理 这里没有filter可以支持了
+    // 返回哈希表，key是窗口ID，value是最大值最小值
+    binary generateHashTable4NonEqualJoin(1:string variableName, 2:i64 window, 3:string nonEqualDependentPredicate)
+
+    // 这个地方首先查询事件的时间戳在不在间隙里，在就更新
+    // 最后一步也用这个函数，因为要进一步收缩区间
+    // without dependent predicates
+    binary filterBasedWindow(1:string variableName, 2:i64 window, 3:i32 headTailMarker, 4:binary shrinkFilter)
+
+    // 等待完善...
+    // 我们就传一个bloom filter 这个目前没有问题
+    // key是两个变量的复合+先后关系表述，用逗号隔开，比如a,b,0表示a在b的前面；a,b,1表示a在b的后面
+    // 返回的是shrink filter
+    // with dependent predicates, return shrink filter
+    binary filterBasedEqualJoin(1:string variableName, 2:i64 window, 3:i32 headTailMarker, 4:binary shrinkFilter,  5:map<string, bool> previousOrNext, 6:map<string, binary> bfByteMap, 7:map<string, list<string>> dependentPredicateStrMap)
+
+    // send filtered events
+    binary getAllFilteredEvents(1:i64 window, 2:binary shrinkFilter)
+}
+
+
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+------------------------------------------------------------------------------------------------------------------------
+FilterServiceImpl.java
+
+
+package storage_service;
+
+import filter.LockFreeBloomFilter;
+import filter.ShrinkFilter;
+import query.EqualDependentPredicate;
+import store.EventCache;
+import store.FullScan;
+
+import org.apache.thrift.TException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class FilterServiceImpl implements FilterService.Iface{
+    private EventCache cache;
+    private List<String> hasFilteredVarNames;
+    @Override
+    public Map<String, Integer> initial(String tableName, Map<String, List<String>> independentPredicateMap) throws TException {
+        long startTime = System.currentTimeMillis();
+        FullScan fullscan = new FullScan(tableName);
+        cache = fullscan.scanAndFilter2(independentPredicateMap);
+        hasFilteredVarNames = new ArrayList<>(8);
+        Map<String, Integer> res = cache.getCardinality();
+        long endTime = System.currentTimeMillis();
+        System.out.println("scan cost: " + (endTime - startTime) + "ms");
+        return res;
+    }
+
+    @Override
+    public ByteBuffer generateIntervals(String variableName, long window, int headTailMarker) throws TException {
+        long startTime = System.currentTimeMillis();
+        ByteBuffer intervalBuffer = cache.generateReplayIntervals(variableName, window, headTailMarker);
+        hasFilteredVarNames.add(variableName);
+        long endTime = System.currentTimeMillis();
+        System.out.println("generate interval cost: " + (endTime - startTime) + "ms");
+        return intervalBuffer;
+    }
+
+    @Override
+    public Map<String, ByteBuffer> generateBF4EqualJoin(String variableName, long window, Map<String, List<String>> dependentPredicateMap, Map<String, Integer> eventNumMap) throws TException {
+        // get bloom filter for join operation,
+        // e.g., t1.a = t2.a and t1.b = t2.b
+        // request sequence: a -> b
+        // then, variableName is b, dependentPredicateMap is {a, [t1.a = t2.a, t1.b = t2.b]}
+        // key: <t1,t2> value: <t1.a = t2.a, t1.b = t2.b>
+
+        int dpMapSize = dependentPredicateMap.size();
+        int evnMapSize = eventNumMap.size();
+        if(dpMapSize != evnMapSize){
+            throw new RuntimeException("Number of dependent predicates does not match number of events");
+        }
+
+        Map<String, ByteBuffer> bfMap = new HashMap<>(dpMapSize << 1);
+        for(String preVarName : dependentPredicateMap.keySet()){
+            List<String> dpStrList = dependentPredicateMap.get(preVarName);
+            List<EqualDependentPredicate> dpList = new ArrayList<>(dpStrList.size());
+            for(String dpStr : dpStrList){
+                dpList.add(new EqualDependentPredicate(dpStr));
+            }
+            ByteBuffer buffer = cache.generateBloomFilter(preVarName, eventNumMap.get(preVarName), window, dpList);
+
+            System.out.println("service generate bf size: " + buffer.capacity());
+
+            bfMap.put(preVarName, buffer);
+        }
+        return bfMap;
+    }
+
+    @Override
+    public ByteBuffer generateHashTable4NonEqualJoin(String variableName, long window, String nonEqualDependentPredicate) throws TException {
+        // 这个函数目前用来测试用
+        // max -len 100M
+        // 190_000_000
+        int size = 16 * 1024 * 1024;
+        long start = System.currentTimeMillis();
+        byte ch = 0;
+        byte[] content = new byte[size];
+//        for(int i = 0; i < size; ++i){
+//            content[i] = ch++;
+//        }
+        ByteBuffer buffer = ByteBuffer.wrap(content);
+        long end = System.currentTimeMillis();
+        System.out.println(end-start);
+        return buffer;
+
+    }
+
+    @Override
+    public ByteBuffer filterBasedWindow(String variableName, long window, int headTailMarker, ByteBuffer shrinkFilter) throws TException {
+        long startTime = System.currentTimeMillis();
+        ShrinkFilter filter = ShrinkFilter.deserialize(shrinkFilter);
+
+        ByteBuffer updatedShrinkFilter = cache.updatePointers(variableName, window, headTailMarker, filter);
+        long endTime = System.currentTimeMillis();
+        System.out.println("varName: " + variableName + " filter cost: " + (endTime - startTime) + "ms");
+        hasFilteredVarNames.add(variableName);
+        return updatedShrinkFilter;
+    }
+
+    @Override
+    public ByteBuffer filterBasedEqualJoin(String variableName, long window, int headTailMarker, ByteBuffer shrinkFilter, Map<String, Boolean> previousOrNext, Map<String, ByteBuffer> bfByteMap, Map<String, List<String>> dependentPredicateStrMap) throws TException {
+        System.out.println("filterBasedEqualJoin");
+        int previousVarNum = previousOrNext.size();
+
+        Map<String, LockFreeBloomFilter> bfMap = new HashMap<>(previousVarNum << 1);
+        Map<String, List<EqualDependentPredicate>> dpMap = new HashMap<>(previousVarNum << 1);
+        for(String previousVariableName : bfByteMap.keySet()){
+            ByteBuffer buffer = bfByteMap.get(previousVariableName);
+            LockFreeBloomFilter bf = LockFreeBloomFilter.deserialize(buffer);
+            bfMap.put(previousVariableName, bf);
+
+            List<EqualDependentPredicate> dps = new ArrayList<>();
+            List<String> dpStrList = dependentPredicateStrMap.get(previousVariableName);
+            for(String dpStr : dpStrList){
+                dps.add(new EqualDependentPredicate(dpStr));
+            }
+            dpMap.put(previousVariableName, dps);
+        }
+        ShrinkFilter sf = ShrinkFilter.deserialize(shrinkFilter);
+        hasFilteredVarNames.add(variableName);
+        return cache.updatePointers(variableName, window, headTailMarker, sf, previousOrNext, bfMap, dpMap);
+    }
+
+    @Override
+    public ByteBuffer getAllFilteredEvents(long window, ByteBuffer shrinkFilter) throws TException {
+        long startTime = System.currentTimeMillis();
+        ShrinkFilter filter = ShrinkFilter.deserialize(shrinkFilter);
+        ByteBuffer buffer = cache.getRecords(window, filter);
+        long endTime = System.currentTimeMillis();
+        System.out.println("write result cost: " + (endTime - startTime) + "ms");
+        return buffer;
+    }
+}
+
+
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+------------------------------------------------------------------------------------------------------------------------
+BitmapServiceImpl.java
+
+package storage_service;
+
+import org.apache.thrift.TException;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
+import store.EventCache;
+import store.FullScan;
+
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Map;
+
+public class BitmapServiceImpl implements BitmapService.Iface{
+    private EventCache cache;
+
+    @Override
+    public Map<String, Integer> initial(String tableName, Map<String, List<String>> independentPredicateMap) throws TException {
+        FullScan fullscan = new FullScan(tableName);
+        cache = fullscan.scanAndFilter2(independentPredicateMap);
+        return cache.getCardinality();
+    }
+
+    @Override
+    public ByteBuffer generateIntervals(String variableName, long window, int headTailMarker) throws TException {
+        // step 1: create initial bitmap
+        return cache.generateIntervalBitmap(variableName, window, headTailMarker);
+    }
+
+    @Override
+    public ByteBuffer filterBasedWindow(String variableName, long window, int headTailMarker, ByteBuffer intervalBitmap) throws TException {
+        Roaring64Bitmap bitmap = new Roaring64Bitmap();
+        try{
+            bitmap.deserialize(intervalBitmap);
+        }catch (Exception e){
+            e.printStackTrace();
+        }
+        return cache.updatePointers(variableName, window, headTailMarker, bitmap);
+    }
+
+    @Override
+    public ByteBuffer getAllFilteredEvents(ByteBuffer intervalBitmap) throws TException {
+        Roaring64Bitmap bitmap = new Roaring64Bitmap();
+        try{
+            bitmap.deserialize(intervalBitmap);
+        }catch (Exception e){
+            e.printStackTrace();
+        }
+        return cache.getRecords(bitmap);
+    }
+}

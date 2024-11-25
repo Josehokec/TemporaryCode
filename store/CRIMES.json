@@ -1,0 +1,1 @@
+{"columnNames":["TYPE","ID","BEAT","DISTRICT","LATITUDE","LONGITUDE","EVENTTIME"],"dataLengths":[32,4,4,4,8,8,8],"dataTypes":["VARCHAR","INT","INT","INT","DOUBLE","DOUBLE","LONG"],"fixedRecordLen":68,"tableName":"CRIMES"}

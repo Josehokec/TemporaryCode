@@ -1,0 +1,1 @@
+{"columnNames":["TICKER","PRICE","VOLUME","TIMESTAMP"],"dataLengths":[4,4,4,8],"dataTypes":["VARCHAR","FLOAT","INT","LONG"],"fixedRecordLen":20,"tableName":"TEST_TABLE"}

@@ -1,0 +1,1 @@
+{"columnNames":["TYPE","ID","A1","A2","A3","A4","TIMESTAMP"],"dataLengths":[8,4,4,8,8,8,8],"dataTypes":["VARCHAR","INT","INT","DOUBLE","VARCHAR","VARCHAR","LONG"],"fixedRecordLen":48,"tableName":"SYNTHETIC"}

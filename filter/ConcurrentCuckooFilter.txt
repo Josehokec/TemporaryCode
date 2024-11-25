@@ -1,0 +1,526 @@
+package filter;
+
+/*
+   Copyright 2016 Mark Gunlogson
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+import java.io.*;
+
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.StampedLock;
+
+
+public class CuckooFilter implements java.io.Serializable{
+    private static final long serialVersionUID = -1337735144654851942L;
+
+    static final int MAX_KICK_OUT = 500;
+    static int BUCKET_SIZE = 4;
+
+    private static final double LOAD_FACTOR = 0.955;
+    private static final double DEFAULT_FP = 0.01;
+    private static final int DEFAULT_CONCURRENCY = 16;
+
+    final CFTable table;
+    final IndexTagCalculator hasher;
+    private final AtomicLong count;
+    CFUtils.Victim victim;
+    // why do not lock
+    boolean hasVictim;
+
+    // for parallelism
+    private final int expectedConcurrency;
+    private final StampedLock victimLock;
+    private transient SegmentedBucketLocker bucketLocker;
+
+
+
+    private CuckooFilter(IndexTagCalculator hasher, CFTable table, AtomicLong count, boolean hasVictim,
+                         CFUtils.Victim victim, int expectedConcurrency) {
+        this.hasher = hasher;
+        this.table = table;
+        this.count = count;
+        this.hasVictim = hasVictim;
+        this.expectedConcurrency = expectedConcurrency;
+
+        // no nulls even if victim hasn't been used!
+        this.victim = (victim == null) ? new CFUtils.Victim() : victim;
+        this.victimLock = new StampedLock();
+        this.bucketLocker = new SegmentedBucketLocker(expectedConcurrency);
+    }
+
+    /***
+     * Builds a Cuckoo Filter.
+     * To Create a Cuckoo filter, construct this then call {@code #build()}.
+     */
+    public static class Builder {
+        // required arguments
+
+        private final long maxKeys;
+        // optional arguments
+        private double fpr = DEFAULT_FP;
+        private int expectedConcurrency = DEFAULT_CONCURRENCY;
+
+        /**
+         * Creates a Builder interface for CuckooFilter with the expected number
+         * of insertions using the default false positive rate and concurrency.
+         * The default false positive rate is 1%.
+         * The default concurrency is 16 expected threads.
+         * @param maxKeys - the number of expected insertions to the constructed
+         */
+        public Builder(long maxKeys) {
+            if(maxKeys < 1){
+                throw new RuntimeException("maxKeys (" + maxKeys + ") must be > 1, increase maxKeys");
+            }
+            this.maxKeys = maxKeys;
+        }
+
+        /**
+         * Sets the false positive rate for the filter (default is 1%).
+         * @param fpr - false positive rate from 0-1 exclusive.
+         * @return - The builder interface
+         */
+        public Builder setFalsePositiveRate(double fpr) {
+            if(fpr <= 0 || fpr > 0.1){
+                throw new RuntimeException("fpp (" + fpr + ") should be in (0, 0.1]");
+            }
+            this.fpr = fpr;
+            return this;
+        }
+
+        /***
+         * Number of simultaneous threads expected to access the filter concurrently.
+         * The default is 16 threads. It is better to overestimate as the cost of
+         * more segments is very small and penalty for contention is high.
+         * This number is not performance critical, any number over the
+         * actual number of threads and within an order of magnitude will work.
+         * @param expectedConcurrency - expected number of threads accessing the filter concurrently.
+         * @return - The builder interface
+         */
+        public Builder setConcurrency(int expectedConcurrency) {
+            if(expectedConcurrency < 1 || (expectedConcurrency & (expectedConcurrency - 1)) != 0){
+                throw new RuntimeException("expectedConcurrency (" + expectedConcurrency + ") must be positive and a power of two");
+            }
+
+            this.expectedConcurrency = expectedConcurrency;
+            return this;
+        }
+
+        /**
+         * Builds and returns a {@code CuckooFilter}.
+         * Invalid configurations will fail on this call.
+         * @return - Cuckoo filter
+         */
+        public CuckooFilter build() {
+            int tagBits = CFUtils.getBitsPerItemForFpRate(fpr, LOAD_FACTOR);
+            int bucketNum = CFUtils.getBucketsNeeded(maxKeys, LOAD_FACTOR, BUCKET_SIZE);
+            IndexTagCalculator hasher = new IndexTagCalculator(bucketNum, tagBits);
+            CFTable table = CFTable.create(tagBits, bucketNum);
+            return new CuckooFilter(hasher, table, new AtomicLong(0), false, null, expectedConcurrency);
+        }
+    }
+
+    /**
+     * Gets the current number of items in the Cuckoo filter
+     * @return - number of items in filter
+     */
+    public long getCount() {
+        return count.get();
+    }
+
+    /**
+     * Gets the current load factor of the Cuckoo filter.
+     * @return load fraction of total space used, 0-1 inclusive
+     */
+    public double getLoadFactor() {
+        return count.get() / (table.getBucketNum() * (double) BUCKET_SIZE);
+    }
+
+
+    /**
+     * Puts an element into this CuckooFilter
+     * Note that:
+     * 1. the filter should be considered full after insertion failure.
+     * 2. inserting the same item more than 8 times will cause an insertion failure.
+     * @param item - item to insert into the filter
+     * @return - true if the cuckoo filter inserts this item successfully.
+     */
+    public boolean put(long item) {
+        BucketAndTag bucketAndTag = hasher.generate(item);
+        int curTag = bucketAndTag.tag;
+        int curIndex = bucketAndTag.index;
+        int altIndex = hasher.altIndex(curIndex, curTag);
+        // before writing, we need to lock
+        bucketLocker.lockBucketsWrite(curIndex, altIndex);
+        try {
+            if (table.insertToBucket(curIndex, curTag) || table.insertToBucket(altIndex, curTag)) {
+                count.incrementAndGet();
+                return true;
+            }
+        } finally {
+            bucketLocker.unlockBucketsWrite(curIndex, altIndex);
+        }
+        // if two buckets are full, we need to kick out an item from buckets
+        // before we kick out an item, we first need to apply victim
+        // if victim slot is already filled, then we cannot insert
+        long victimLockStamp = writeLockVictimIfClear();
+        if (victimLockStamp == 0L){
+            // victim was set...can't insert
+            System.out.println("victim was set...can't insert");
+            return false;
+        }
+        // then we obtain victim, note that we have lock it
+        try {
+            // fill victim slot and run fun insert method below
+            victim.setTag(curTag);
+            victim.setBucketIndex1(curIndex);
+            victim.setBucketIndex2(altIndex);
+            hasVictim = true;
+            for (int i = 0; i < MAX_KICK_OUT; i++) {
+                if (trySwapVictimIntoEmptySpot()){
+                    break;
+                }
+                // debug
+                if(i == MAX_KICK_OUT - 1){
+                    System.out.println("reach max kick out");
+                }
+            }
+            // count is incremented here because we should never
+            // increase count when not locking buckets or victim.
+            count.incrementAndGet();
+        } finally {
+            victimLock.unlock(victimLockStamp);
+        }
+
+        // either managed to insert victim using retries or it is in
+        // victim slot from another thread. Either way, it's in the table.
+        return true;
+    }
+
+    /**
+     * Checks if the victim is clear using a read lock and upgrades to
+     * a write lock if it is clear. Will either return a write lock stamp
+     * if victim is clear, or zero if a victim is already set.
+     * @return - a write lock stamp for the Victim or 0 if victim is set
+     */
+    private long writeLockVictimIfClear() {
+        long victimLockstamp = victimLock.readLock();
+        if (!hasVictim) {
+            // try to upgrade our read lock to write exclusive if victim
+            long writeLockStamp = victimLock.tryConvertToWriteLock(victimLockstamp);
+            // could not get write lock
+            if (writeLockStamp == 0L) {
+                // so unlock the victim
+                victimLock.unlock(victimLockstamp);
+                // now just block until we have exclusive lock
+                victimLockstamp = victimLock.writeLock();
+                // make sure victim is still clear with our new write lock
+                if (!hasVictim)
+                    return victimLockstamp;
+                else {
+                    // victim has been set by another thread, so just give up our lock
+                    victimLock.tryUnlockWrite();
+                    return 0L;
+                }
+            } else {
+                return writeLockStamp;
+            }
+        } else {
+            victimLock.unlock(victimLockstamp);
+            return 0L;
+        }
+    }
+
+    /**
+     * if we kicked a tag we need to move it to alternate position, possibly kicking
+     * another tag there, repeating the process until we succeed or run out of chances
+     * Swap steps:
+     * 1. insert our current tag into a position in an already full bucket,
+     * 2. then move the tag that we overwrote to it's alternate index.
+     * When we run out of attempts,we leave the orphaned tag in the victim slot.
+     * Note that the most nefarious deadlock is that two or more threads run out of tries
+     * simultaneously and all need a place to store a victim even though we only have one slot
+     */
+    private boolean trySwapVictimIntoEmptySpot() {
+        int curIndex = victim.getBucketIndex2();
+        // lock bucket. We always use I2 since victim tag is from bucket I1
+        bucketLocker.lockSingleBucketWrite(curIndex);
+        int curTag = table.swapRandomTagInBucket(curIndex, victim.getTag());
+        bucketLocker.unlockSingleBucketWrite(curIndex);
+        // new victim's I2 is different as long as tag isn't the same
+        int altIndex = hasher.altIndex(curIndex, curTag);
+        // try to insert the new victim tag in its alternate bucket
+        bucketLocker.lockSingleBucketWrite(altIndex);
+        try {
+            if (table.insertToBucket(altIndex, curTag)) {
+                hasVictim = false;
+                return true;
+            } else {
+                // still have a victim, but a different one...
+                victim.setTag(curTag);
+                // new victim always shares I1 with previous victims' I2
+                victim.setBucketIndex1(curIndex);
+                victim.setBucketIndex2(altIndex);
+            }
+        } finally {
+            bucketLocker.unlockSingleBucketWrite(altIndex);
+        }
+        return false;
+    }
+
+    /**
+     * @param item - key
+     * @return - true if the item might be in the filter
+     */
+    public boolean contains(long item) {
+        BucketAndTag bucketAndTag = hasher.generate(item);
+        int i1 = bucketAndTag.index;
+        int i2 = hasher.altIndex(bucketAndTag.index, bucketAndTag.tag);
+        bucketLocker.lockBucketsRead(i1, i2);
+        try {
+            if (table.findTag(i1, i2, bucketAndTag.tag)) {
+                return true;
+            }
+        } finally {
+            bucketLocker.unlockBucketsRead(i1, i2);
+        }
+        // we still need to check victim cache
+        return checkIsVictim(bucketAndTag);
+    }
+
+    private boolean checkIsVictim(BucketAndTag tagToCheck) {
+        if(tagToCheck == null){
+            throw new RuntimeException("exception: tagToCheck is null ");
+        }
+        victimLock.readLock();
+        try {
+            if (hasVictim) {
+                if (victim.getTag() == tagToCheck.tag
+                        && (tagToCheck.index == victim.getBucketIndex1() || tagToCheck.index == victim.getBucketIndex2())) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            victimLock.tryUnlockRead();
+        }
+    }
+
+    public void debug(){
+        System.out.println("inserted keys: " + count.get());
+        table.display();
+//        System.out.println("number of buckets: " + table.getBucketNum());
+//        System.out.println("length of fingerprint: " + hasher.getTagBits());
+//        System.out.println("number of locks: " + bucketLocker.getConcurrentSegments());
+//        System.out.println("load factor: " + getLoadFactor());
+        victimLock.readLock();
+        try {
+            if (hasVictim) {
+                System.out.println("victim.tag: " + victim.getTag() + "victim.index1: "
+                        + victim.getBucketIndex1() + "victim.index2: " + victim.getBucketIndex2());
+            }
+        } finally {
+            victimLock.tryUnlockRead();
+        }
+    }
+
+    public void showFalseNegativeInfo(long item){
+        BucketAndTag bucketAndTag = hasher.generate(item);
+        int tag = bucketAndTag.tag;
+        int bucketIndex1 = bucketAndTag.index;
+        int bucketIndex2 = hasher.altIndex(bucketIndex1, tag);
+        System.out.println("item: " + item + " i1:" + bucketIndex1 + " i2:" + bucketIndex2 + " tag:" + tag);
+    }
+
+    public static void main(String[] args) throws Exception{
+        class InsertionThread implements Runnable{
+            private CuckooFilter cf;
+            private long[] data;
+            private String threadName;
+
+            InsertionThread(CuckooFilter cf, long[] data, String threadName){
+                this.cf = cf;
+                this.data = data;
+                this.threadName = threadName;
+            }
+
+            @Override
+            public void run() {
+                for(long item : data){
+                    if(cf.put(item)){
+                        //System.out.println("insert item (" + item + ") successfully");
+                    }else{
+                        System.out.println("insert item (" + item + ") fails");
+                    }
+                }
+            }
+        }
+
+        PrintStream printStream = new PrintStream("cf_debug.txt");
+        System.setOut(printStream);
+
+        for(int loop = 0; loop < 1000; ++loop){
+            int threadNum = 4;
+            int itemNum = 60;
+            int singleThreadItemNum = itemNum / threadNum;
+            //System.out.println("Cuckoo filter testing, number of items: " + itemNum + " threads: " + threadNum);
+            System.out.println("-------------------------------------");
+            CuckooFilter cf = new CuckooFilter.Builder(itemNum).setConcurrency(threadNum).setFalsePositiveRate(0.01).build();
+
+            // create datasets
+            long[][] datasets = new long[threadNum][singleThreadItemNum];
+            long itemKey = 0;
+            for(int i = 0; i < threadNum; ++i){
+                for(int j = 0; j < singleThreadItemNum; ++j){
+                    datasets[i][j] = itemKey++;
+                }
+            }
+
+            // create multiple threads
+            Thread[] threads = new Thread[threadNum];
+            for(int i = 0; i < threadNum; ++i){
+                threads[i] = new Thread(new InsertionThread(cf, datasets[i], "thread_" + i));
+            }
+
+            // start insertion
+            for(int i = 0; i < threadNum; ++i){
+                threads[i].start();
+            }
+            // wait all threads finish insertion
+            for (Thread t : threads) {
+                try {
+                    t.join();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            for(int key = 0; key < itemNum; ++key){
+                // bloom filter no false negative
+                if(!cf.contains(key)){
+                    System.out.println("-------------------------------------");
+                    cf.debug();
+                    System.out.println("debug-false negative key: " + key);
+                    cf.showFalseNegativeInfo(key);
+                }
+            }
+        }
+    }
+}
+
+/*
+public boolean delete(long item) {
+    BucketAndTag bucketAndTag = hasher.generate(item);
+    int i1 = bucketAndTag.index;
+    int tag = bucketAndTag.tag;
+    int i2 = hasher.altIndex(bucketAndTag.index, tag);
+
+    bucketLocker.lockBucketsWrite(i1, i2);
+    boolean deleteSuccess = false;
+    try {
+        if (table.deleteFromBucket(i1, tag) || table.deleteFromBucket(i2, tag))
+            deleteSuccess = true;
+    } finally {
+        bucketLocker.unlockBucketsWrite(i1, i2);
+    }
+    // try to insert the victim again if we were able to delete an item
+    if (deleteSuccess) {
+        count.decrementAndGet();
+        // might as well try to insert again
+        insertCachedVictim();
+        return true;
+    }
+    // if delete failed, but we have a victim, check if the item we're trying
+    // to delete IS actually the victim
+    long victimLockStamp = writeLockVictimIfSet();
+    if (victimLockStamp == 0L)
+        return false;
+    else {
+        try {
+            // check victim cache, rewriting
+            if (victim.getTag() == tag && victim.getBucketIndex1() == i1 && victim.getBucketIndex2() ==i2) {
+                hasVictim = false;
+                count.decrementAndGet();
+                return true;
+            } else
+                return false;
+        } finally {
+            victimLock.unlock(victimLockStamp);
+        }
+    }
+}
+*/
+/**
+ * Attempts to insert the victim item if it exists.
+ * inserting from the victim cache to the main table do not affect the count
+ * since items in the victim cache are technically still in the table
+ */
+/*
+private void insertCachedVictim() {
+    long victimLockStamp = writeLockVictimIfSet();
+    if (victimLockStamp == 0L)
+        return;
+    try {
+        int bucketIndex1 = victim.getBucketIndex1();
+        int bucketIndex2 = victim.getBucketIndex2();
+        int tag = victim.getTag();
+        // when we get here we definitely have a victim and a write lock
+        bucketLocker.lockBucketsWrite(bucketIndex1, bucketIndex2);
+        try {
+            if (table.insertToBucket(bucketIndex1, tag) || table.insertToBucket(bucketIndex2, tag)) {
+                // set this here because we already have lock
+                hasVictim = false;
+            }
+        } finally {
+            bucketLocker.unlockBucketsWrite(bucketIndex1, bucketIndex2);
+        }
+    } finally {
+        victimLock.unlock(victimLockStamp);
+    }
+}
+*/
+/***
+ * Checks if the victim is set using a read lock and upgrades to a write lock if it is.
+ * Will either return a write lock stamp if victim is set, or zero if no victim.
+ * @return a write lock stamp for the Victim or 0 if no victim
+ */
+/*
+private long writeLockVictimIfSet() {
+    long victimLockstamp = victimLock.readLock();
+    if (hasVictim) {
+        // try to upgrade our read lock to write exclusive if victim
+        long writeLockStamp = victimLock.tryConvertToWriteLock(victimLockstamp);
+        // could not get write lock
+        if (writeLockStamp == 0L) {
+            // so unlock the victim
+            victimLock.unlock(victimLockstamp);
+            // now just block until we have exclusive lock
+            victimLockstamp = victimLock.writeLock();
+            // make sure victim is still set with our new write lock
+            if (!hasVictim) {
+                // victim has been cleared by another thread... so just give
+                // up our lock
+                victimLock.tryUnlockWrite();
+                return 0L;
+            } else
+                return victimLockstamp;
+        } else {
+            return writeLockStamp;
+        }
+    } else {
+        victimLock.unlock(victimLockstamp);
+        return 0L;
+    }
+}
+*/
